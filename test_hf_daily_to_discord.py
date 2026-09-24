@@ -4,6 +4,7 @@
 """
 
 import io
+import json
 import datetime as dt
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -31,12 +32,28 @@ class FakeResp:
 
 
 def fake_papers(n):
+    # 키워드 분류로 LLM 분야에 들어가도록 제목에 'language model'을 넣는다.
     return [
-        {"title": f"Paper {i}",
+        {"title": f"Language model paper {i}",
          "paper": {"id": f"2609.{i:05d}", "ai_summary": "s" * 200,
                    "upvotes": i, "ai_keywords": ["a", "b"]}}
         for i in range(n)
     ]
+
+
+def item(title, one_liner="", keywords=(), upvotes=1, cat=None):
+    p = {"id": "2609.00001", "title": title, "one_liner": one_liner, "keywords": list(keywords),
+         "upvotes": upvotes, "url": "https://huggingface.co/papers/2609.00001"}
+    if cat:
+        p["cat"] = cat
+    return p
+
+
+def anthropic_resp(results):
+    """Anthropic Messages API 응답 흉내. results는 [{"ko":..., "cat":...}, ...]."""
+    text = json.dumps(results, ensure_ascii=False)
+    return FakeResp(200, body={"stop_reason": "end_turn",
+                               "content": [{"type": "text", "text": text}]})
 
 
 def run_main(argv):
@@ -161,6 +178,17 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         post.assert_not_called()
         self.assertIn("embed 1/1", out)
+        self.assertIn("관심 분야 3편 / 전체 3편", out)
+
+    def test_other_papers_are_counted_not_sent(self):
+        papers = fake_papers(2) + [{"title": "Protein folding with graph networks",
+                                    "paper": {"id": "2609.99999", "upvotes": 100}}]
+        code, out, _, _ = self.run_with(
+            papers, lambda *a, **k: FakeResp(204), argv=("--date", "2026-09-23", "--dry-run"))
+        self.assertEqual(code, 0)
+        self.assertNotIn("Protein folding", out)
+        self.assertIn("그 외 분야 1편 제외", out)
+        self.assertIn("관심 분야 2편 / 전체 3편", out)
 
 
 class FormatTest(unittest.TestCase):
@@ -188,6 +216,102 @@ class FormatTest(unittest.TestCase):
                             "paper": {"id": "1", "summary": "abs\n\ntract", "upvotes": 1}}])
         self.assertEqual(items[0]["title"], "Line one line two")
         self.assertEqual(items[0]["one_liner"], "abs tract")
+
+    def test_sections_follow_category_order_with_header_on_first_paper(self):
+        items = [item("gen", cat="생성형"), item("llm a", cat="LLM"), item("other", cat="기타"),
+                 item("llm b", cat="LLM")]
+        blocks, shown = m.build_sections(items)
+        self.assertEqual(shown, 3)
+        self.assertTrue(blocks[0].startswith("__**🧠 LLM · 2편**__\n**[llm a]"))
+        self.assertTrue(blocks[1].startswith("**[llm b]"))
+        self.assertTrue(blocks[2].startswith("__**🎨 생성형 · 1편**__\n**[gen]"))
+        self.assertEqual(blocks[3], "*그 외 분야 1편 제외*")
+        self.assertNotIn("other", "".join(blocks))
+
+    def test_sections_when_nothing_matches(self):
+        blocks, shown = m.build_sections([item("x", cat="기타"), item("y", cat="기타")])
+        self.assertEqual(shown, 0)
+        self.assertEqual(blocks, ["*그 외 분야 2편 제외*"])
+
+
+class KeywordClassifyTest(unittest.TestCase):
+    def test_examples(self):
+        cases = [
+            ("A web agent for GUI tasks", "Agent"),
+            ("Diffusion transformers for text-to-video", "생성형"),
+            ("Open-vocabulary object detection", "CV"),
+            ("Scaling test-time reasoning in LLMs", "LLM"),
+            ("Protein folding with graph networks", "기타"),
+            # 여러 분야에 걸치면 좁은 분야가 우선
+            ("A multimodal agent that reads images", "Agent"),
+            ("Visual reasoning benchmark for VLMs", "CV"),
+        ]
+        for title, want in cases:
+            self.assertEqual(m.classify_by_keywords(item(title)), want, title)
+
+    def test_uses_hf_keywords_too(self):
+        self.assertEqual(m.classify_by_keywords(item("Something", keywords=["LLM"])), "LLM")
+
+
+@mock.patch.object(m, "TRANSLATE", True)
+@mock.patch.object(m, "ANTHROPIC_API_KEY", "test-key")
+class EnrichTest(unittest.TestCase):
+    def test_llm_translation_and_category_applied(self):
+        items = [item("Paper A", "summary a"), item("Paper B", "summary b")]
+        resp = anthropic_resp([{"ko": "요약 A", "cat": " CV "}, {"ko": "요약 B", "cat": "기타"}])
+        with mock.patch.object(m.requests, "post", return_value=resp) as post:
+            m.enrich(items)
+        self.assertEqual([(p["one_liner"], p["cat"]) for p in items],
+                         [("요약 A", "CV"), ("요약 B", "기타")])
+        prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("제목: Paper A", prompt)
+
+    def test_unknown_category_falls_back_to_keywords(self):
+        items = [item("A web agent", "english")]
+        resp = anthropic_resp([{"ko": "한글", "cat": "Robotics"}])
+        with mock.patch.object(m.requests, "post", return_value=resp):
+            m.enrich(items)
+        self.assertEqual((items[0]["one_liner"], items[0]["cat"]), ("한글", "Agent"))
+
+    def test_llm_failure_keeps_english_and_uses_keywords(self):
+        items = [item("Diffusion for video generation", "english")]
+        with mock.patch.object(m.requests, "post", side_effect=requests.ConnectionError("x")), \
+                redirect_stderr(io.StringIO()):
+            m.enrich(items)
+        self.assertEqual((items[0]["one_liner"], items[0]["cat"]), ("english", "생성형"))
+
+    def test_count_mismatch_falls_back(self):
+        items = [item("LLM paper", "english"), item("Other", "english")]
+        resp = anthropic_resp([{"ko": "하나만", "cat": "LLM"}])
+        with mock.patch.object(m.requests, "post", return_value=resp), \
+                redirect_stderr(io.StringIO()):
+            m.enrich(items)
+        self.assertEqual([p["one_liner"] for p in items], ["english", "english"])
+        self.assertEqual([p["cat"] for p in items], ["LLM", "기타"])
+
+    def test_batches_of_llm_batch_size(self):
+        items = [item(f"LLM paper {i}", "english") for i in range(m.LLM_BATCH_SIZE + 5)]
+        calls = []
+
+        def post(url, headers=None, json=None, timeout=None):
+            n = json["messages"][0]["content"].count("제목: ")
+            calls.append(n)
+            return anthropic_resp([{"ko": "한글", "cat": "LLM"}] * n)
+
+        with mock.patch.object(m.requests, "post", post):
+            m.enrich(items)
+        self.assertEqual(calls, [m.LLM_BATCH_SIZE, 5])
+        self.assertTrue(all(p["one_liner"] == "한글" for p in items))
+
+    def test_no_api_key_skips_llm(self):
+        items = [item("LLM paper", "english")]
+        with mock.patch.object(m, "ANTHROPIC_API_KEY", ""), \
+                mock.patch.object(m.requests, "post") as post, \
+                redirect_stderr(io.StringIO()) as err:
+            m.enrich(items)
+        post.assert_not_called()
+        self.assertEqual(items[0]["cat"], "LLM")
+        self.assertIn("ANTHROPIC_API_KEY 없음", err.getvalue())
 
 
 if __name__ == "__main__":

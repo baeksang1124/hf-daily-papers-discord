@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-HF Daily Papers -> 한 줄 요약(한글 번역) -> Discord 웹훅 전송
+HF Daily Papers -> 분야 분류 + 한 줄 요약(한글 번역) -> Discord 웹훅 전송
 
 동작:
   1) Hugging Face Daily Papers API에서 대상 날짜(기본: 어제 KST)의 논문을 통째로 가져온다.
-  2) 각 논문의 ai_summary(한 줄 요약)를 한글로 일괄 번역한다(가벼운 Haiku 호출).
-  3) "제목 + 한글 한 줄 + 키워드 + 업보트 + 링크"로 압축해 디스코드 웹훅으로 보낸다.
+  2) 각 논문의 ai_summary(한 줄 요약)를 한글로 번역하고 분야(LLM/Agent/CV/생성형/기타)를
+     고른다(가벼운 Haiku 호출). 호출을 못 하거나 실패하면 영어 원문 + 키워드 규칙으로 분류.
+  3) 관심 분야 논문만 분야별로 묶어 "제목 + 한글 한 줄 + 키워드 + 업보트 + 링크"로
+     디스코드 웹훅에 보낸다. 기타 분야는 개수만 적는다.
 
 환경변수:
   DISCORD_WEBHOOK_URL   (필수) 디스코드 채널 웹훅 URL
-  ANTHROPIC_API_KEY     (번역 켤 때 필요) 없으면 영어 원문 그대로 전송
-  HF_TRANSLATE          기본 "1". "0"이면 번역 건너뛰고 영어 그대로
-  HF_MODEL              번역 모델. 기본 claude-haiku-4-5-20251001
+  ANTHROPIC_API_KEY     번역·AI 분류에 필요. 없으면 영어 원문 + 키워드 분류
+  HF_TRANSLATE          기본 "1". "0"이면 번역·AI 분류를 건너뛰고 영어 원문 + 키워드 분류
+  HF_MODEL              번역·분류 모델. 기본 claude-haiku-4-5-20251001
 
 종료 코드:
   0  전송 완료, 또는 대상 날짜에 논문이 없음
@@ -49,6 +51,17 @@ CHUNK_CHAR_LIMIT = 3800
 REQUEST_TIMEOUT = 30
 # HF 조회 시도 횟수. 일시적인 네트워크 오류 한 번으로 하루치를 놓치지 않기 위함.
 FETCH_ATTEMPTS = 3
+
+# 관심 분야: (키, 디스코드 섹션 제목, 분류 기준). 이 순서대로 디스코드에 나온다.
+# 분류 기준 문구는 그대로 Haiku 프롬프트에 들어간다. 분야를 바꾸려면 여기와 _KEYWORD_RULES를 고친다.
+CATEGORIES = [
+    ("LLM", "🧠 LLM", "언어 모델의 학습·추론(reasoning)·정렬·효율화·평가, 텍스트 생성"),
+    ("Agent", "🤖 Agent", "도구 사용, 계획, 웹·GUI·코드 에이전트, 멀티에이전트"),
+    ("CV", "👁️ CV", "이미지·영상·3D의 인식과 이해 (검출, 분할, 시각 질의응답 등)"),
+    ("생성형", "🎨 생성형", "이미지·영상·오디오·3D 생성 (diffusion, flow matching 등)"),
+]
+OTHER = "기타"
+_INTEREST_KEYS = {key for key, _, _ in CATEGORIES}
 
 
 class FetchError(Exception):
@@ -118,20 +131,56 @@ def extract(papers):
     return out
 
 
-# 한 번 호출에 번역할 최대 항목 수. 너무 크면 응답이 max_tokens에서 잘려 JSON 파싱 실패.
-TRANSLATE_BATCH_SIZE = 20
+# LLM 분류를 못 쓸 때의 대체 규칙. 제목·요약·HF 키워드에서 찾고, 위에 있는 규칙이 우선한다.
+# 에이전트·생성처럼 좁은 분야를 먼저 보고, 범위가 넓은 LLM을 마지막에 본다.
+_KEYWORD_RULES = [
+    (cat, re.compile(pattern, re.IGNORECASE)) for cat, pattern in [
+        ("Agent", r"\bagent(s|ic)?\b|multi-agent|tool[- ]use|\bgui\b|web navigation"),
+        ("생성형", r"diffusion|flow matching|text-to-(image|video|audio|speech|3d|music)"
+                 r"|\b(image|video|audio|music|3d|speech) (generation|synthesis|editing)"),
+        ("CV", r"\bvision\b|visual|\bimages?\b|\bvideos?\b|segmentation|object detection"
+               r"|\b3d\b|point cloud|\bvlms?\b"),
+        ("LLM", r"\bllms?\b|language models?|reasoning|\brlhf\b|instruction[- ]tun"
+                r"|chain[- ]of[- ]thought|tokeniz"),
+    ]
+]
 
 
-def _translate_chunk(texts):
-    """항목 리스트를 1회 호출로 번역. 실패 시 그 묶음만 영어 원문 반환."""
-    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
-    prompt = (
-        "다음은 AI 논문 한 줄 요약(영어)들이다. 각 항목을 자연스러운 한국어로 번역하라.\n"
-        "전문 용어(LoRA, RLHF 등)는 굳이 풀어쓰지 말고 그대로 둔다.\n"
+def classify_by_keywords(p):
+    """키워드 규칙으로 분야 하나를 고른다. 영어 원문 기준."""
+    text = " ".join([p["title"], p["one_liner"], " ".join(map(str, p["keywords"]))])
+    for cat, pattern in _KEYWORD_RULES:
+        if pattern.search(text):
+            return cat
+    return OTHER
+
+
+# 한 번 호출에 처리할 최대 논문 수. 너무 크면 응답이 max_tokens에서 잘려 JSON 파싱 실패.
+LLM_BATCH_SIZE = 20
+
+
+def _llm_prompt(items):
+    cats = "\n".join(f"   - {key}: {desc}" for key, _, desc in CATEGORIES)
+    numbered = "\n".join(
+        f"{i+1}. 제목: {p['title']}\n   요약: {p['one_liner']}" for i, p in enumerate(items)
+    )
+    return (
+        "다음은 AI 논문의 제목과 한 줄 요약(영어)이다. 각 논문마다 두 가지를 하라.\n"
+        "1) 요약을 자연스러운 한국어로 번역한다. 전문 용어(LoRA, RLHF 등)는 굳이 풀어쓰지 말고 그대로 둔다.\n"
+        "2) 아래 분야 중 하나를 고른다.\n"
+        f"{cats}\n"
+        f"   - {OTHER}: 위 어디에도 뚜렷하게 해당하지 않음\n"
+        "   여러 분야에 걸치면 논문의 핵심 기여 하나만 고른다. "
+        "예: LLM 기반 에이전트 → Agent, 텍스트로 이미지를 만드는 모델 → 생성형.\n"
         "설명 없이 JSON 배열만 출력한다. 순서와 개수는 입력과 동일해야 한다.\n"
-        '예: ["번역1", "번역2"]\n\n'
+        f'예: [{{"ko": "번역1", "cat": "{CATEGORIES[0][0]}"}}, {{"ko": "번역2", "cat": "{OTHER}"}}]\n\n'
         f"{numbered}"
     )
+
+
+def _call_llm(items):
+    """번역 + 분야 분류를 1회 호출로. [{"ko": ..., "cat": ...}, ...], 실패하면 None."""
+    fallback = "이 묶음은 영어 원문 + 키워드 분류"
     try:
         r = requests.post(
             ANTHROPIC_API,
@@ -143,39 +192,44 @@ def _translate_chunk(texts):
             json={
                 "model": MODEL,
                 "max_tokens": 4000,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": _llm_prompt(items)}],
             },
             timeout=60,
         )
         r.raise_for_status()
         resp = r.json()
         if resp.get("stop_reason") == "max_tokens":
-            print("[warn] 응답이 max_tokens에서 잘림 → 이 묶음 영어 원문 사용", file=sys.stderr)
-            return texts
+            print(f"[warn] 응답이 max_tokens에서 잘림 → {fallback}", file=sys.stderr)
+            return None
         text = "".join(
             b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"
         ).strip()
         text = text.replace("```json", "").replace("```", "").strip()
-        ko = json.loads(text)
-        if isinstance(ko, list) and len(ko) == len(texts):
-            return [str(x) for x in ko]
-        print("[warn] 번역 개수 불일치 → 영어 원문 사용", file=sys.stderr)
+        out = json.loads(text)
+        if isinstance(out, list) and len(out) == len(items):
+            return [x if isinstance(x, dict) else {} for x in out]
+        print(f"[warn] 응답 개수 불일치 → {fallback}", file=sys.stderr)
     except Exception as e:
-        print(f"[warn] 번역 실패 → 영어 원문 사용: {e}", file=sys.stderr)
-    return texts
+        print(f"[warn] 번역·분류 실패 → {fallback}: {e}", file=sys.stderr)
+    return None
 
 
-def translate_batch(texts):
-    """영어 한 줄 요약 리스트를 한글 번역. 큰 목록은 잘림 방지를 위해 나눠서 호출."""
-    if not TRANSLATE or not texts:
-        return texts
-    if not ANTHROPIC_API_KEY:
-        print("[warn] ANTHROPIC_API_KEY 없음 → 번역 생략, 영어 원문 전송", file=sys.stderr)
-        return texts
-    out = []
-    for i in range(0, len(texts), TRANSLATE_BATCH_SIZE):
-        out.extend(_translate_chunk(texts[i:i + TRANSLATE_BATCH_SIZE]))
-    return out
+def enrich(items):
+    """각 논문의 one_liner를 한글로 바꾸고 cat(분야)을 붙인다.
+    LLM을 못 쓰거나 실패한 논문은 영어 원문을 두고 키워드 규칙으로 분류한다."""
+    use_llm = TRANSLATE and bool(ANTHROPIC_API_KEY)
+    if TRANSLATE and not ANTHROPIC_API_KEY:
+        print("[warn] ANTHROPIC_API_KEY 없음 → 번역 생략, 키워드로 분류", file=sys.stderr)
+    for i in range(0, len(items), LLM_BATCH_SIZE):
+        chunk = items[i:i + LLM_BATCH_SIZE]
+        results = (_call_llm(chunk) if use_llm else None) or [{}] * len(chunk)
+        for p, r in zip(chunk, results):
+            cat = str(r.get("cat") or "").strip()
+            # 키워드 분류는 영어 원문으로 해야 하므로 번역 반영보다 먼저 한다.
+            p["cat"] = cat if cat in _INTEREST_KEYS or cat == OTHER else classify_by_keywords(p)
+            ko = r.get("ko")
+            if isinstance(ko, str) and ko.strip():
+                p["one_liner"] = ko.strip()
 
 
 # 디스코드 마크다운에서 서식 기호로 해석되는 문자. 앞에 \ 를 붙여 글자 그대로 보이게 한다.
@@ -206,6 +260,24 @@ def build_blocks(items):
             lines.append("`" + "` `".join(keywords) + "`")
         blocks.append("\n".join(lines))
     return blocks
+
+
+def build_sections(items):
+    """관심 분야별로 묶은 블록 목록과 관심 분야 논문 수. 기타 분야는 마지막에 개수만 적는다."""
+    blocks, shown = [], 0
+    for key, label, _ in CATEGORIES:
+        group = [p for p in items if p.get("cat") == key]
+        if not group:
+            continue
+        shown += len(group)
+        paper_blocks = build_blocks(group)
+        # 섹션 제목이 청크 끝에 홀로 남지 않도록 첫 논문 블록에 붙인다.
+        paper_blocks[0] = f"__**{label} · {len(group)}편**__\n{paper_blocks[0]}"
+        blocks.extend(paper_blocks)
+    excluded = len(items) - shown
+    if excluded:
+        blocks.append(f"*그 외 분야 {excluded}편 제외*")
+    return blocks, shown
 
 
 def chunk_blocks(blocks):
@@ -248,12 +320,12 @@ def _send(payload):
     return True
 
 
-def post_discord(date_str, total, chunks, dry_run=False):
+def post_discord(date_str, shown, total, chunks, dry_run=False):
     """청크를 embed 메시지로 차례로 보낸다. 실패한 메시지 수를 돌려준다."""
     n = len(chunks)
     failed = 0
     for i, desc in enumerate(chunks, 1):
-        title = f"🤗 HF Daily Papers — {date_str} (총 {total}편)"
+        title = f"🤗 HF Daily Papers — {date_str} (관심 분야 {shown}편 / 전체 {total}편)"
         if n > 1:
             title += f"  · {i}/{n}"
         payload = {"embeds": [{"title": title, "description": desc, "color": 0xFFD21E}]}
@@ -288,16 +360,14 @@ def main(argv=None):
         print(f"[info] {date_str}: 논문 없음. 보내지 않고 종료.")
         return 0
 
-    ko = translate_batch([p["one_liner"] for p in items])
-    for p, k in zip(items, ko):
-        p["one_liner"] = k
-
-    chunks = chunk_blocks(build_blocks(items))
-    failed = post_discord(date_str, len(items), chunks, dry_run=args.dry_run)
+    enrich(items)
+    blocks, shown = build_sections(items)
+    chunks = chunk_blocks(blocks)
+    failed = post_discord(date_str, shown, len(items), chunks, dry_run=args.dry_run)
     if failed:
         print(f"[error] {date_str}: 메시지 {len(chunks)}개 중 {failed}개 전송 실패", file=sys.stderr)
         return 1
-    print(f"[done] {date_str}: {len(items)}편 전송 ({len(chunks)}개 메시지)")
+    print(f"[done] {date_str}: 관심 분야 {shown}편 / 전체 {len(items)}편 ({len(chunks)}개 메시지)")
     return 0
 
 
