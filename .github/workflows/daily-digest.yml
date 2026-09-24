@@ -2,8 +2,10 @@ name: HF Daily Papers digest
 
 on:
   schedule:
-    # 매일 00:10 UTC = 09:10 KST. 정각은 GitHub 스케줄러가 붐벼 지연이 커서 10분 비킴.
-    - cron: "10 0 * * *"
+    # 매일 02:40 UTC = 11:40 KST. 정각은 GitHub 스케줄러가 붐벼 지연이 커서 피함.
+    # HF 목록 D에는 D+1 01:30 UTC(미 동부 21:30 EDT)까지, 서머타임이 아닌 기간엔 02:30 UTC(21:30 EST)까지
+    # 논문이 더 붙는다. 00:10 UTC에 가져가면 평일 약 40%에서 1~4편(대개 1편)이 빠져서, 연중 마감 이후로 잡음.
+    - cron: "40 2 * * *"
   workflow_dispatch:
     inputs:
       date:
@@ -42,7 +44,7 @@ jobs:
           INPUT_DATE: ${{ inputs.date }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # HF 목록은 UTC 날짜 기준으로 하루 동안 채워짐 → 다 찬 '어제' 목록을 명시적으로 지정.
+          # 02:40 UTC엔 어제(KST) 날짜 목록이 마감돼 있음 → 다 찬 '어제' 목록을 명시적으로 지정.
           # 주말(목록 없음)엔 "논문 없음"으로 끝나므로 같은 목록이 중복 게시되지 않음.
           DATE="${INPUT_DATE:-$(TZ=Asia/Seoul date -d yesterday +%F)}"
           ARGS=(--date "$DATE")
