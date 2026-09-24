@@ -217,6 +217,13 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(items[0]["title"], "Line one line two")
         self.assertEqual(items[0]["one_liner"], "abs tract")
 
+    def test_extract_keeps_full_abstract(self):
+        long_abs = "word " * 200
+        items = m.extract([{"title": "T", "paper": {"id": "1", "summary": long_abs, "upvotes": 1}}])
+        self.assertEqual(items[0]["abstract"], long_abs.strip())
+        self.assertTrue(items[0]["one_liner"].endswith("…"))
+        self.assertEqual(len(items[0]["one_liner"]), 301)
+
     def test_sections_follow_category_order_with_header_on_first_paper(self):
         items = [item("gen", cat="생성형"), item("llm a", cat="LLM"), item("other", cat="기타"),
                  item("llm b", cat="LLM")]
@@ -265,6 +272,16 @@ class EnrichTest(unittest.TestCase):
                          [("요약 A", "CV"), ("요약 B", "기타")])
         prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
         self.assertIn("제목: Paper A", prompt)
+
+    def test_prompt_uses_full_abstract_over_truncated_one_liner(self):
+        p = item("Paper A", "truncated…")
+        p["abstract"] = "full abstract " * 50
+        resp = anthropic_resp([{"ko": "요약", "cat": "LLM"}])
+        with mock.patch.object(m.requests, "post", return_value=resp) as post:
+            m.enrich([p])
+        prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("내용: " + "full abstract " * 50, prompt)
+        self.assertNotIn("truncated…", prompt)
 
     def test_unknown_category_falls_back_to_keywords(self):
         items = [item("A web agent", "english")]

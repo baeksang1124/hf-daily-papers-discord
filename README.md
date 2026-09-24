@@ -1,13 +1,13 @@
 # hf-daily-papers-discord
 
-Hugging Face [Daily Papers](https://huggingface.co/papers)를 가져와 관심 분야(LLM·Agent·CV·생성형) 논문만 골라, 한 줄 요약을 한국어로 번역해 디스코드 웹훅으로 올리는 스크립트.
+Hugging Face [Daily Papers](https://huggingface.co/papers)를 가져와 관심 분야(LLM·Agent·CV·생성형) 논문만 골라, abstract를 한국어 한 줄로 요약해 디스코드 웹훅으로 올리는 스크립트.
 
 ## 동작
 1. Hugging Face Daily Papers API에서 대상 날짜의 논문을 가져온다. 기본값은 어제(KST)다. 오늘 목록은 아직 채워지는 중일 수 있어서 쓰지 않는다. 그날 논문이 없으면 아무것도 보내지 않고 끝낸다.
-2. 각 논문의 `ai_summary`(없으면 abstract 앞부분)를 Claude Haiku로 번역하고, 같은 호출에서 분야를 하나 고른다. 20편 단위로 나눠 호출해 응답 잘림을 막는다.
+2. 각 논문의 abstract 전체를 Claude Haiku가 읽고 한국어 한 문장으로 요약하며, 같은 호출에서 분야를 하나 고른다. 20편 단위로 나눠 호출해 응답 잘림을 막는다.
 3. 관심 분야 논문만 분야별로 묶고, 분야 안에서는 업보트 순으로 `제목(링크) + 업보트 + 한글 한 줄 + 키워드`를 디스코드 embed로 보낸다. 관심 분야 밖 논문은 마지막에 개수만 적는다. embed 글자 한도에 맞춰 여러 메시지로 나눈다.
 
-번역·분류 호출이 실패하면 해당 묶음은 영어 원문으로 보내고, 분야는 키워드 규칙으로 정한다.
+요약·분류 호출이 실패하면 해당 묶음은 영어 원문(`ai_summary`, 없으면 abstract 앞 300자)으로 보내고, 분야는 키워드 규칙으로 정한다.
 
 ### 분야
 | 분야 | 기준 |

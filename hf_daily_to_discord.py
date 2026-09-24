@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-HF Daily Papers -> 분야 분류 + 한 줄 요약(한글 번역) -> Discord 웹훅 전송
+HF Daily Papers -> 분야 분류 + 한글 한 줄 요약 -> Discord 웹훅 전송
 
 동작:
   1) Hugging Face Daily Papers API에서 대상 날짜(기본: 어제 KST)의 논문을 통째로 가져온다.
-  2) 각 논문의 ai_summary(한 줄 요약)를 한글로 번역하고 분야(LLM/Agent/CV/생성형/기타)를
-     고른다(가벼운 Haiku 호출). 호출을 못 하거나 실패하면 영어 원문 + 키워드 규칙으로 분류.
+  2) 각 논문의 abstract를 한국어 한 문장으로 요약하고 분야(LLM/Agent/CV/생성형/기타)를
+     고른다(가벼운 Haiku 호출). 호출을 못 하거나 실패하면 영어 원문(ai_summary 또는
+     abstract 앞부분) + 키워드 규칙으로 분류.
   3) 관심 분야 논문만 분야별로 묶어 "제목 + 한글 한 줄 + 키워드 + 업보트 + 링크"로
      디스코드 웹훅에 보낸다. 기타 분야는 개수만 적는다.
 
@@ -112,10 +113,11 @@ def extract(papers):
         paper = item.get("paper", {}) or {}
         pid = paper.get("id") or item.get("id") or ""
         title = _clean(item.get("title") or paper.get("title"))
+        # abstract 전체는 LLM 요약 입력으로 쓰고, 화면에는 LLM을 못 쓸 때만 앞부분이 나간다.
+        abstract = _clean(item.get("summary") or paper.get("summary"))
         one_liner = _clean(paper.get("ai_summary"))
         if not one_liner:
             # ai_summary 없으면 abstract 앞부분으로 대체
-            abstract = _clean(item.get("summary") or paper.get("summary"))
             one_liner = (abstract[:300] + "…") if len(abstract) > 300 else abstract
         keywords = paper.get("ai_keywords") or []
         upvotes = paper.get("upvotes", item.get("upvotes", 0)) or 0
@@ -123,6 +125,7 @@ def extract(papers):
             "id": pid,
             "title": title,
             "one_liner": one_liner,
+            "abstract": abstract,
             "keywords": keywords[:5],
             "upvotes": int(upvotes),
             "url": f"https://huggingface.co/papers/{pid}" if pid else "",
@@ -161,19 +164,23 @@ LLM_BATCH_SIZE = 20
 
 def _llm_prompt(items):
     cats = "\n".join(f"   - {key}: {desc}" for key, _, desc in CATEGORIES)
+    # abstract 전체를 준다. 잘린 앞부분만 주면 모델이 제목을 번역해 돌려주는 경우가 있었다.
     numbered = "\n".join(
-        f"{i+1}. 제목: {p['title']}\n   요약: {p['one_liner']}" for i, p in enumerate(items)
+        f"{i+1}. 제목: {p['title']}\n   내용: {p.get('abstract') or p['one_liner']}"
+        for i, p in enumerate(items)
     )
     return (
-        "다음은 AI 논문의 제목과 한 줄 요약(영어)이다. 각 논문마다 두 가지를 하라.\n"
-        "1) 요약을 자연스러운 한국어로 번역한다. 전문 용어(LoRA, RLHF 등)는 굳이 풀어쓰지 말고 그대로 둔다.\n"
-        "2) 아래 분야 중 하나를 고른다.\n"
+        "다음은 AI 논문의 제목과 내용(영어 abstract)이다. 각 논문마다 두 가지를 하라.\n"
+        "1) ko: '내용'을 읽고 이 논문이 무엇을 했는지 자연스러운 한국어 한 문장으로 요약한다. "
+        "제목을 번역하거나 되풀이하지 말고, 방법이나 결과처럼 제목에 없는 정보를 담는다. "
+        "전문 용어(LoRA, RLHF 등)는 굳이 풀어쓰지 말고 그대로 둔다.\n"
+        "2) cat: 아래 분야 중 하나를 고른다.\n"
         f"{cats}\n"
         f"   - {OTHER}: 위 어디에도 뚜렷하게 해당하지 않음\n"
         "   여러 분야에 걸치면 논문의 핵심 기여 하나만 고른다. "
         "예: LLM 기반 에이전트 → Agent, 텍스트로 이미지를 만드는 모델 → 생성형.\n"
         "설명 없이 JSON 배열만 출력한다. 순서와 개수는 입력과 동일해야 한다.\n"
-        f'예: [{{"ko": "번역1", "cat": "{CATEGORIES[0][0]}"}}, {{"ko": "번역2", "cat": "{OTHER}"}}]\n\n'
+        f'예: [{{"ko": "요약1", "cat": "{CATEGORIES[0][0]}"}}, {{"ko": "요약2", "cat": "{OTHER}"}}]\n\n'
         f"{numbered}"
     )
 
@@ -215,7 +222,7 @@ def _call_llm(items):
 
 
 def enrich(items):
-    """각 논문의 one_liner를 한글로 바꾸고 cat(분야)을 붙인다.
+    """각 논문의 one_liner를 한글 한 줄 요약으로 바꾸고 cat(분야)을 붙인다.
     LLM을 못 쓰거나 실패한 논문은 영어 원문을 두고 키워드 규칙으로 분류한다."""
     use_llm = TRANSLATE and bool(ANTHROPIC_API_KEY)
     if TRANSLATE and not ANTHROPIC_API_KEY:
