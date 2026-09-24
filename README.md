@@ -32,7 +32,18 @@ python hf_daily_to_discord.py --date 2026-06-02  # 특정 날짜
 python hf_daily_to_discord.py --dry-run          # 디스코드로 안 보내고 콘솔에만 출력
 ```
 
-### 매일 자동 실행 (cron 예시)
+## GitHub Actions로 매일 실행
+`.github/workflows/daily-digest.yml`이 매일 09:10 KST(00:10 UTC)에 **어제(KST) 날짜** 목록을 올린다.
+HF 목록은 UTC 날짜 기준으로 하루 동안 채워지므로 다 찬 어제 목록을 쓰고, 주말처럼 목록이 빈 날은 게시하지 않는다(실행 상태를 저장하지 않아도 중복 게시 없음).
+
+1. 저장소 Settings → Secrets and variables → Actions → **New repository secret**
+   - `DISCORD_WEBHOOK_URL` (필수)
+   - `ANTHROPIC_API_KEY` (번역용, 선택)
+2. Actions 탭 → **HF Daily Papers digest** → **Run workflow**로 수동 실행. `date`로 날짜 지정, `dry_run`으로 전송 없이 로그만 확인 가능.
+
+참고: GitHub 예약 실행은 부하에 따라 수 분~수십 분 늦게 시작될 수 있고, 저장소에 60일간 활동이 없으면 예약 워크플로가 자동 비활성화된다(Actions 탭에서 다시 켤 수 있음).
+
+### 서버에서 매일 실행 (cron 예시)
 HF 목록은 미국 시간 기준으로 올라오므로 KST 오전에 돌리면 보통 전날 목록이 잡힌다.
 ```cron
 0 9 * * * cd /path/to/hf-daily-papers-discord && set -a && . ./.env && set +a && python hf_daily_to_discord.py >> digest.log 2>&1

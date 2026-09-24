@@ -1,0 +1,50 @@
+name: HF Daily Papers digest
+
+on:
+  schedule:
+    # 매일 00:10 UTC = 09:10 KST. 정각은 GitHub 스케줄러가 붐벼 지연이 커서 10분 비킴.
+    - cron: "10 0 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "게시할 날짜 YYYY-MM-DD (비우면 어제 KST)"
+        required: false
+        default: ""
+      dry_run:
+        description: "디스코드로 보내지 않고 로그에만 출력"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Post digest
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          INPUT_DATE: ${{ inputs.date }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # HF 목록은 UTC 날짜 기준으로 하루 동안 채워짐 → 다 찬 '어제' 목록을 명시적으로 지정.
+          # 주말(목록 없음)엔 "논문 없음"으로 끝나므로 같은 목록이 중복 게시되지 않음.
+          DATE="${INPUT_DATE:-$(TZ=Asia/Seoul date -d yesterday +%F)}"
+          ARGS=(--date "$DATE")
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          python hf_daily_to_discord.py "${ARGS[@]}"
